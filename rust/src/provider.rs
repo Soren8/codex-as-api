@@ -6526,7 +6526,7 @@ mod tests {
 
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
-        assert!(user_agent.starts_with("codex_cli_rs/0.153.3 ("));
+        assert!(user_agent.starts_with("codex_cli_rs/0.159.1 ("));
         assert!(user_agent.ends_with(") codex-as-api/0.7.0"));
     }
 
@@ -6539,7 +6539,7 @@ mod tests {
 
     #[test]
     fn test_codex_cli_version_defaults_to_pinned_upstream_contract() {
-        assert_eq!(pinned_codex_compatibility_version(), "0.153.3");
+        assert_eq!(pinned_codex_compatibility_version(), "0.159.1");
     }
 
     #[test]

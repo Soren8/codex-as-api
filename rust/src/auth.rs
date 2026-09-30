@@ -468,6 +468,38 @@ fn refresh_lock(path: &Path) -> Result<std::sync::Arc<Mutex<()>>, AuthError> {
         .clone())
 }
 
+fn refresh_file_lock(path: &Path) -> Result<fs::File, AuthError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|_| {
+        AuthError::Refresh("OAuth refresh lock directory is unavailable".to_string())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AuthError::Refresh("auth path must name a UTF-8 file".to_string()))?;
+    let lock_path = parent.join(format!(".{file_name}.refresh.lock"));
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(lock_path)
+        .map_err(|_| AuthError::Refresh("OAuth refresh lock file is unavailable".to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| AuthError::Refresh("OAuth refresh lock permissions failed".to_string()))?;
+    }
+    file.lock()
+        .map_err(|_| AuthError::Refresh("OAuth refresh file lock failed".to_string()))?;
+    // Closing the file releases the lock; keep its inode persistent for waiters.
+    Ok(file)
+}
+
 fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -710,6 +742,7 @@ fn refresh_from_observed(
     let _guard = lock
         .lock()
         .map_err(|_| AuthError::Refresh("OAuth refresh lock is poisoned".to_string()))?;
+    let _file_guard = refresh_file_lock(&current.auth_path)?;
 
     let latest = load_token_data(current.auth_path.to_str())?;
     fail_if_account_changed(&current, &latest)?;
@@ -927,6 +960,220 @@ mod tests {
     use std::io::Write;
 
     static AUTH_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn wait_for_refresh_fixture_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture timed out: {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by interprocess refresh tests"]
+    fn refresh_process_fixture() {
+        let path = std::env::var("REFRESH_FIXTURE_AUTH").unwrap();
+        let marker = PathBuf::from(std::env::var("REFRESH_FIXTURE_MARKER").unwrap());
+        let observed = load_token_data(Some(&path)).unwrap();
+        assert_eq!(observed.refresh_token, "refresh-old");
+        fs::write(marker.with_extension("ready"), b"").unwrap();
+        wait_for_refresh_fixture_file(&marker.with_extension("go"));
+        let proactive = std::env::var("REFRESH_FIXTURE_MODE").unwrap() == "proactive";
+        let result = refresh_from_observed(observed, proactive);
+        if std::env::var_os("REFRESH_FIXTURE_EXPECT_ERROR").is_some() {
+            assert!(matches!(
+                result,
+                Err(AuthError::RefreshUpstreamHttp { status: 500, .. })
+            ));
+        } else {
+            let token = result.unwrap();
+            assert_eq!(token.refresh_token, "refresh-rotated");
+            assert!(!token.expires_within_refresh_window());
+        }
+    }
+
+    fn run_interprocess_refresh_case(mode: &str, first_fails: bool) {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir =
+            std::env::temp_dir().join(format!("codex-refresh-process-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join("alias")).unwrap();
+        let path = dir.join("auth.json");
+        let jwt = |claims: Value| {
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+        write_auth_json(&path, &serde_json::json!({"tokens": {
+            "access_token": jwt(serde_json::json!({"exp": 1})),
+            "id_token": jwt(serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "fixture-account"}})),
+            "refresh_token": "refresh-old"
+        }})).unwrap();
+        let payload = serde_json::json!({
+            "access_token": jwt(serde_json::json!({"exp": 9999999999i64})),
+            "refresh_token": "refresh-rotated"
+        })
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (received, first_request) = std::sync::mpsc::channel();
+        let server_count = count.clone();
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let number = server_count.fetch_add(1, Ordering::SeqCst);
+                        if number == 0 {
+                            received.send(()).unwrap();
+                        }
+                        let payload = payload.clone();
+                        workers.push(std::thread::spawn(move || {
+                            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                            let mut request = Vec::new();
+                            let mut buffer = [0; 4096];
+                            loop {
+                                let length = socket.read(&mut buffer).unwrap();
+                                assert!(length > 0);
+                                request.extend_from_slice(&buffer[..length]);
+                                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                                    let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                                    if request.len() >= end + 4 + length {
+                                        let body: Value = serde_json::from_slice(&request[end + 4..]).unwrap();
+                                        assert_eq!(body["refresh_token"], "refresh-old");
+                                        break;
+                                    }
+                                }
+                            }
+                            // Keep the exchange open while the other process attempts refresh.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            let (status, body) = if first_fails && number == 0 { ("500 Internal Server Error", "{}") } else { ("200 OK", payload.as_str()) };
+                            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let mut children = Vec::new();
+        for index in 0..2 {
+            let marker = dir.join(format!("child-{index}"));
+            let auth_path = if index == 0 {
+                path.clone()
+            } else {
+                dir.join("alias/../auth.json")
+            };
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "auth::tests::refresh_process_fixture",
+                    "--test-threads=1",
+                ])
+                .env("REFRESH_FIXTURE_AUTH", auth_path)
+                .env("REFRESH_FIXTURE_MARKER", &marker)
+                .env("REFRESH_FIXTURE_MODE", mode)
+                .env(REFRESH_URL_OVERRIDE_ENV, &endpoint)
+                .env_remove("REFRESH_FIXTURE_EXPECT_ERROR");
+            if first_fails && index == 0 {
+                command.env("REFRESH_FIXTURE_EXPECT_ERROR", "1");
+            }
+            children.push(command.spawn().unwrap());
+            wait_for_refresh_fixture_file(&marker.with_extension("ready"));
+        }
+        fs::write(dir.join("child-0.go"), b"").unwrap();
+        first_request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        fs::write(dir.join("child-1.go"), b"").unwrap();
+        let mut statuses = Vec::new();
+        for child in &mut children {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    statuses.push(status);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    statuses.push(child.wait().unwrap());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let requests = count.load(Ordering::SeqCst);
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            statuses.iter().all(|status| status.success()),
+            "child statuses: {statuses:?}"
+        );
+        assert_eq!(
+            requests,
+            if first_fails { 2 } else { 1 },
+            "{mode} refresh exchanges across independent processes"
+        );
+    }
+
+    #[test]
+    fn independent_processes_coalesce_expired_and_unauthorized_refreshes() {
+        run_interprocess_refresh_case("proactive", false);
+        run_interprocess_refresh_case("unauthorized", false);
+    }
+
+    #[test]
+    fn independent_process_can_refresh_after_another_process_refresh_error() {
+        run_interprocess_refresh_case("proactive", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_lock_file_is_persistent_owner_only_and_released_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("codex-refresh-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".auth.json.refresh.lock");
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let guard = refresh_file_lock(&dir.join("auth.json")).unwrap();
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(guard);
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        file.try_lock().unwrap();
+        drop(file);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
         match value {

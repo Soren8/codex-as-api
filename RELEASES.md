@@ -1,5 +1,19 @@
 # Release Notes
 
+## Fork compatibility fix
+
+- Update the shared Codex request identity and catalog `client_version` to
+  `0.159.1` (`rust-v0.159.1`, commit
+  `8e68a98ef03cdde76d2e6800791ebdf1b3b95b24`) so upstream can advertise
+  version-gated models such as `gpt-6-sol` (minimum client `0.155.0`). Model
+  availability still comes exclusively from each account's authenticated live
+  catalog; this pin does not guarantee GPT-6.1 availability. No bundled model
+  rows or aliases are added.
+- Serialize OAuth refreshes across backend processes with a persistent advisory
+  lock beside the auth file. Waiting sessions re-read rotated credentials before
+  refreshing, for both proactive expiry and HTTP 401 recovery; errors release
+  the lock. On Unix the lock file is owner-only (`0600`).
+
 ## v0.7.0
 
 ### Live authenticated model catalog

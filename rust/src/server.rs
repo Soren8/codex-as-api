@@ -4247,6 +4247,67 @@ mod live_catalog_tests {
     }
 
     #[tokio::test]
+    async fn models_advertises_client_version_that_unlocks_sol_6_catalog_row() {
+        async fn version_gated_models(
+            State(state): State<MockState>,
+            headers: HeaderMap,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let version: Vec<u32> = query["client_version"]
+                .split('.')
+                .map(|part| part.parse().unwrap())
+                .collect();
+            state.model_requests.lock().unwrap().push((headers, query));
+            // Official Sol 6 metadata requires Codex 0.155.0 or newer.
+            let models = if version >= vec![0, 155, 0] {
+                let mut model = live_model("gpt-6-sol", 1, true);
+                model["minimal_client_version"] = json!("0.155.0");
+                vec![model]
+            } else {
+                vec![]
+            };
+            Json(json!({"models": models}))
+        }
+
+        let state = MockState::new(json!({"models": []}));
+        let app = Router::new()
+            .route("/models", get(version_gated_models))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let requests = state.model_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let client_version = &requests[0].1["client_version"];
+        let version: Vec<u32> = client_version
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        assert!(
+            version >= vec![0, 155, 0],
+            "catalog client_version {client_version} must satisfy Sol 6 minimum 0.155.0"
+        );
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["id"], "gpt-6-sol");
+    }
+
+    #[tokio::test]
     async fn models_exposes_an_empty_live_catalog_without_default_fallback() {
         let state = MockState::new(json!({"models": []}));
         let (upstream, upstream_handle) = start_mock_upstream(state).await;
